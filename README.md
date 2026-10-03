@@ -1,184 +1,194 @@
 # Pedidos API
 
-API de gerenciamento de pedidos para e-commerce. FastAPI + MongoDB + RabbitMQ + Kafka, tudo orquestrado via Docker Compose.
+![CI](https://github.com/NavarroArthur/API-DE-PEDIDOS/actions/workflows/ci.yml/badge.svg)
 
-Ao cadastrar um pedido a API persiste no MongoDB, publica mensagem na fila RabbitMQ e evento no tópico Kafka.
+API de pedidos para e-commerce com arquitetura orientada a eventos: **FastAPI + MongoDB + RabbitMQ + Kafka**, tudo em Docker Compose.
 
-## Stack
+O pedido é criado pela API, processado de forma assíncrona por um worker via RabbitMQ e cada mudança de estado vira um evento no Kafka, consumido por um serviço de auditoria. A publicação usa **transactional outbox** para não perder evento se um broker cair.
 
-- **FastAPI** (Python 3.12, async)
-- **MongoDB 7** (driver Motor async)
-- **RabbitMQ 3.13** (aio-pika)
-- **Kafka 7.6.1** + **Zookeeper** (aiokafka)
-- **Pytest** + httpx + mongomock-motor
+## Arquitetura
 
-## Estrutura
-
-```
-pedidos-api/
-├── app/
-│   ├── config.py            # Settings via env vars
-│   ├── db.py                # Motor client + collection
-│   ├── dependencies.py      # Publishers singletons (FastAPI Depends)
-│   ├── main.py              # FastAPI + lifespan + /health
-│   ├── models.py            # PedidoCreate, Pedido, StatusPedido
-│   ├── messaging/
-│   │   ├── kafka.py         # Publisher Kafka + retry connect
-│   │   └── rabbitmq.py      # Publisher Rabbit + retry connect
-│   └── routes/pedidos.py    # POST /pedidos, GET /pedidos
-├── tests/
-│   ├── conftest.py          # AsyncClient + mongomock + FakePublisher
-│   └── test_pedidos.py      # 8 testes
-├── Dockerfile
-├── docker-compose.yml
-├── requirements.txt
-├── pytest.ini
-├── .env.example
-├── .dockerignore
-└── .gitignore
+```mermaid
+flowchart LR
+    C[Cliente] -->|POST / PATCH| API[FastAPI]
+    API -->|pedido + evento<br/>no mesmo documento| M[(MongoDB<br/>pedidos)]
+    R[Relay do outbox<br/>dentro da API] -->|lê outbox| M
+    R -->|PedidoCriado| Q[[RabbitMQ<br/>pedidos.processar]]
+    R -->|todos os eventos<br/>key = pedido_id| K{{Kafka<br/>pedidos.eventos}}
+    Q --> W[worker-processamento]
+    W -->|PENDENTE → PROCESSANDO → ENVIADO| M
+    Q -.->|falha| DLQ[[pedidos.processar.dlq]]
+    K --> A[worker-auditoria]
+    A -->|upsert por event_id| E[(MongoDB<br/>eventos)]
+    API -->|GET /pedidos/id/eventos| E
 ```
 
-## Pré-requisitos
+| Peça | Papel |
+|------|-------|
+| **API** | Valida, aplica a máquina de estados e grava pedido + evento atomicamente |
+| **Relay do outbox** | Task em background na API; publica eventos pendentes e remove do outbox |
+| **RabbitMQ** | Fila de trabalho (comando "processe este pedido"), com dead-letter queue |
+| **worker-processamento** | Consome a fila e avança o pedido até `ENVIADO` |
+| **Kafka** (KRaft, sem Zookeeper) | Log de eventos de domínio, particionado por pedido |
+| **worker-auditoria** | Consumer group que monta a trilha de auditoria |
 
-- Docker Desktop (Windows/Mac) ou Docker Engine + Compose v2 (Linux)
-- Portas livres: `8000`, `27017`, `5672`, `15672`, `29092`
+### Decisões de projeto
+
+- **Outbox no próprio documento.** Em vez de uma coleção `outbox` separada (que exigiria transação multi-documento e replica set), o evento vai num array `outbox` dentro do pedido. O MongoDB garante atomicidade por documento, então pedido e evento são gravados juntos ou nenhum dos dois.
+- **At-least-once + consumidores idempotentes.** O relay só remove o evento depois de publicar; se cair no meio, republica. A auditoria usa `event_id` como `_id` (reentrega não duplica). O worker decide pelo estado atual do pedido, então reprocessar é seguro.
+- **Concorrência otimista.** Mudança de status é um `update` condicionado ao status lido. Se o cliente cancela enquanto o worker processa, um dos dois perde e recebe conflito; o worker relê e respeita o cancelamento.
+- **Ordem por pedido no Kafka.** A chave da mensagem é o `pedido_id`, então os eventos de um pedido ficam na mesma partição, em ordem.
+- **RabbitMQ para trabalho, Kafka para fatos.** A fila distribui tarefas entre workers (ack/reject, DLQ); o tópico guarda o histórico que qualquer consumer group novo pode reler desde o início.
+
+## Máquina de estados
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDENTE
+    PENDENTE --> PROCESSANDO: worker
+    PENDENTE --> CANCELADO
+    PROCESSANDO --> ENVIADO: worker
+    PROCESSANDO --> CANCELADO
+    ENVIADO --> ENTREGUE
+    ENTREGUE --> [*]
+    CANCELADO --> [*]
+```
+
+Transição fora do diagrama retorna `409 Conflict`.
 
 ## Executar
 
-Um único comando sobe API + Mongo + Rabbit + Kafka + Zookeeper:
+Pré-requisitos: Docker com Compose v2. Portas livres: `8000`, `27017`, `5672`, `15672`, `29092`.
 
 ```bash
-docker compose up --build
+docker compose up -d --build --wait
 ```
 
-API disponível em `http://localhost:8000`. Kafka pode levar 30-90s para ficar `healthy` na primeira execução — a API faz retry automático.
+Swagger: http://localhost:8000/docs · RabbitMQ UI: http://localhost:15672 (`guest`/`guest`)
 
-Derrubar (mantém volume Mongo):
 ```bash
-docker compose down
-```
-
-Derrubar e zerar dados:
-```bash
-docker compose down -v
+docker compose down        # mantém dados
+docker compose down -v     # zera dados
 ```
 
 ## Endpoints
 
-Swagger UI: `http://localhost:8000/docs`
+| Método | Rota | Descrição |
+|--------|------|-----------|
+| `POST` | `/pedidos` | Cria pedido (`PENDENTE`) |
+| `GET` | `/pedidos?status=&cliente=&limit=20&offset=0` | Lista paginada, mais recentes primeiro |
+| `GET` | `/pedidos/{id}` | Detalhe com histórico de status |
+| `PATCH` | `/pedidos/{id}/status` | Muda status (`{"status": "CANCELADO"}`) |
+| `GET` | `/pedidos/{id}/eventos` | Trilha de auditoria vinda do Kafka |
+| `GET` | `/health` | Mongo, RabbitMQ e Kafka; `503` se algum cair |
 
-### POST /pedidos — Cadastrar pedido
+### Exemplo
 
-Request:
-```json
-{
-  "cliente": "Arthur Navarro",
-  "produto": "Notebook",
-  "quantidade": 2
-}
+```bash
+curl -X POST localhost:8000/pedidos -H 'Content-Type: application/json' \
+  -d '{"cliente": "Arthur Navarro", "produto": "Notebook", "quantidade": 2}'
 ```
 
-Response `201 Created`:
 ```json
 {
   "id": "9706978f-6bd4-48b4-b15c-ef01169536ed",
   "cliente": "Arthur Navarro",
   "produto": "Notebook",
   "quantidade": 2,
-  "status": "PENDENTE"
+  "status": "PENDENTE",
+  "criado_em": "2026-10-03T00:33:47.512000Z",
+  "atualizado_em": "2026-10-03T00:33:47.512000Z",
+  "historico": [{ "status": "PENDENTE", "em": "2026-10-03T00:33:47.512000Z" }]
 }
 ```
 
-Efeitos colaterais:
-- Documento inserido na coleção `ecommerce.pedidos` no MongoDB.
-- Mensagem publicada na fila RabbitMQ `pedidos.criados` (payload mínimo `{id, status}`).
-- Evento publicado no tópico Kafka `pedidos.criados` (payload completo).
+Alguns segundos depois, `GET /pedidos/{id}` mostra `ENVIADO` e `GET /pedidos/{id}/eventos` traz:
 
-### GET /pedidos — Listar pedidos
-
-Response `200 OK`:
 ```json
 [
-  {
-    "id": "9706978f-...",
-    "cliente": "Arthur Navarro",
-    "produto": "Notebook",
-    "quantidade": 2,
-    "status": "PENDENTE"
-  }
+  { "tipo": "PedidoCriado",         "dados": { "cliente": "Arthur Navarro", "produto": "Notebook", "quantidade": 2, "status": "PENDENTE" } },
+  { "tipo": "PedidoStatusAlterado", "dados": { "de": "PENDENTE", "para": "PROCESSANDO" } },
+  { "tipo": "PedidoStatusAlterado", "dados": { "de": "PROCESSANDO", "para": "ENVIADO" } }
 ]
 ```
 
-### GET /health — Healthcheck
-
-Response `200 OK`: `{"status": "ok"}` quando MongoDB está acessível.
-
-## Modelo de Pedido
-
-| Campo | Tipo | Regras |
-|-------|------|--------|
-| `id` | string (UUID4) | Gerado pela API |
-| `cliente` | string | obrigatório, 1-200 chars |
-| `produto` | string | obrigatório, 1-200 chars |
-| `quantidade` | int | obrigatório, > 0 |
-| `status` | enum | inicial sempre `PENDENTE` |
-
-Status possíveis: `PENDENTE`, `PROCESSANDO`, `ENVIADO`, `ENTREGUE`, `CANCELADO`.
+(campos `event_id`, `pedido_id` e `ocorrido_em` omitidos)
 
 ## Testes
 
-8 testes cobrindo cadastro, listagem, publicação em Rabbit/Kafka e validações.
-
-Os testes usam `mongomock-motor` e publishers fake — não precisam de Mongo/Rabbit/Kafka rodando.
-
 ```bash
 python -m venv .venv
-.venv\Scripts\activate           # Windows
-# source .venv/bin/activate      # Linux/Mac
-pip install -r requirements.txt
-pytest -v
+.venv\Scripts\activate             # Windows
+# source .venv/bin/activate        # Linux/Mac
+pip install -r requirements-dev.txt
+pytest -v                          # 35 testes, sem precisar de Docker
 ```
 
-Saída esperada: `8 passed`.
+Os testes unitários usam `mongomock-motor` e publishers fake: cobrem API, máquina de estados, relay do outbox (inclusive falha do broker), worker (retomada, cancelamento) e idempotência da auditoria.
 
-## Validar mensageria após subir
+Fluxo ponta a ponta contra a stack real:
 
-### MongoDB
 ```bash
-docker exec -it pedidos-mongo mongosh --quiet --eval "db.getSiblingDB('ecommerce').pedidos.find().pretty()"
+docker compose up -d --build --wait
+pytest -m e2e -v
 ```
 
-### RabbitMQ
-UI de gerenciamento: `http://localhost:15672` (login `guest` / `guest`) → tab **Queues and Streams** → fila `pedidos.criados`.
+A CI (GitHub Actions) roda lint (`ruff`), testes unitários e o e2e com a stack completa.
 
-### Kafka
+## Inspecionar a mensageria
+
 ```bash
-docker exec -it pedidos-kafka kafka-console-consumer --bootstrap-server localhost:9092 --topic pedidos.criados --from-beginning --timeout-ms 5000
+# Eventos no Kafka
+docker exec -it pedidos-kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic pedidos.eventos --from-beginning --property print.key=true
+
+# Filas e DLQ no RabbitMQ
+docker exec pedidos-rabbitmq rabbitmqctl list_queues name messages
+
+# Logs dos workers
+docker compose logs -f worker-processamento worker-auditoria
+```
+
+## Estrutura
+
+```
+app/
+├── main.py                  # FastAPI, lifespan, /health, inicia o relay
+├── config.py                # Settings via variáveis de ambiente
+├── db.py                    # Motor client, coleções e índices
+├── models.py                # Schemas Pydantic
+├── services.py              # Regras de negócio e máquina de estados
+├── outbox.py                # Relay do transactional outbox
+├── messaging/
+│   ├── rabbitmq.py          # Publisher/consumer + topologia com DLQ
+│   └── kafka.py             # Producer e loop de consumer
+├── routes/pedidos.py
+└── workers/
+    ├── processamento.py     # Consumer RabbitMQ
+    └── auditoria.py         # Consumer Kafka
+tests/
+├── test_pedidos.py          # API
+├── test_mensageria.py       # Outbox, workers, auditoria
+└── e2e/                     # Contra o docker compose
 ```
 
 ## Variáveis de ambiente
 
-Padrões definidos em [app/config.py](app/config.py). Override via `.env` (ver `.env.example`).
+Padrões em [app/config.py](app/config.py); veja [.env.example](.env.example).
 
 | Variável | Default |
 |----------|---------|
 | `MONGO_URI` | `mongodb://mongo:27017` |
 | `MONGO_DB` | `ecommerce` |
 | `RABBITMQ_URL` | `amqp://guest:guest@rabbitmq:5672/` |
-| `RABBITMQ_QUEUE` | `pedidos.criados` |
-| `KAFKA_BOOTSTRAP` | `kafka:9092` |
-| `KAFKA_TOPIC` | `pedidos.criados` |
-| `CONNECT_RETRIES` | `30` |
-| `CONNECT_RETRY_DELAY` | `2.0` |
+| `RABBITMQ_QUEUE` / `RABBITMQ_DLQ` | `pedidos.processar` / `pedidos.processar.dlq` |
+| `KAFKA_BOOTSTRAP` | `kafka:9092` (do host: `localhost:29092`) |
+| `KAFKA_TOPIC` | `pedidos.eventos` |
+| `OUTBOX_POLL_INTERVAL` | `0.5` s |
+| `PROCESSAMENTO_DELAY` | `2.0` s (simula separação/despacho) |
 
-## Portas expostas
+## Próximos passos
 
-| Serviço | Host | Container |
-|---------|------|-----------|
-| API | 8000 | 8000 |
-| MongoDB | 27017 | 27017 |
-| RabbitMQ AMQP | 5672 | 5672 |
-| RabbitMQ UI | 15672 | 15672 |
-| Kafka (externo) | 29092 | 29092 |
-
-Para clientes Kafka rodando no host, usar `localhost:29092`. Dentro da rede do compose, usar `kafka:9092`.
+- Autenticação (JWT) e pedido com múltiplos itens e valor total
+- Métricas (Prometheus) e tracing (OpenTelemetry) propagando o `event_id`
+- Retry com backoff antes de mandar para a DLQ

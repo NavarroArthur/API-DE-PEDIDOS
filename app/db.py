@@ -17,7 +17,23 @@ def close_db() -> None:
         _client = None
 
 
-def pedidos_collection() -> AsyncIOMotorCollection:
+def _collection(name: str) -> AsyncIOMotorCollection:
     if _client is None:
         raise RuntimeError("Mongo client not initialized")
-    return _client[settings.mongo_db]["pedidos"]
+    return _client[settings.mongo_db][name]
+
+
+def pedidos_collection() -> AsyncIOMotorCollection:
+    return _collection("pedidos")
+
+
+def eventos_collection() -> AsyncIOMotorCollection:
+    return _collection("eventos")
+
+
+async def ensure_indexes() -> None:
+    pedidos = pedidos_collection()
+    await pedidos.create_index("id", unique=True)
+    await pedidos.create_index([("status", 1), ("criado_em", -1)])
+    await pedidos.create_index("outbox.event_id")
+    await eventos_collection().create_index([("pedido_id", 1), ("ocorrido_em", 1)])

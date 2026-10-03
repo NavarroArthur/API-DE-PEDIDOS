@@ -1,13 +1,5 @@
 from app.messaging.kafka import KafkaPublisher
-from app.messaging.rabbitmq import RabbitMQPublisher
+from app.messaging.rabbitmq import RabbitMQClient
 
-rabbit_publisher = RabbitMQPublisher()
+rabbit_client = RabbitMQClient()
 kafka_publisher = KafkaPublisher()
-
-
-def get_rabbitmq() -> RabbitMQPublisher:
-    return rabbit_publisher
-
-
-def get_kafka() -> KafkaPublisher:
-    return kafka_publisher
