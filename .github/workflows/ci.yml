@@ -28,7 +28,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest httpx
+      - run: pip install -r requirements-dev.txt
       - name: Subir stack
         run: docker compose up -d --build --wait --wait-timeout 300
         env:
